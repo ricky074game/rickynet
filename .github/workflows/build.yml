@@ -1,0 +1,158 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  WINTUN_VERSION: "0.14.1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Portable logic: build the cross-platform crates and run the unit tests
+  # (wire framing codec, usbmux protocol, CLI args) on Linux.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test portable crates
+        run: |
+          cargo test -p rickynet-wire
+          cargo test -p rickynet-win
+          cargo build -p rickynet-core
+
+  # ---------------------------------------------------------------------------
+  # iOS: build the Rust static lib for aarch64-apple-ios, generate the C header,
+  # rasterize the app icon, generate the Xcode project with XcodeGen, build an
+  # UNSIGNED .app, and package it as an unsigned .ipa (Payload/ + zip).
+  # ---------------------------------------------------------------------------
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build rickynet-core staticlib (aarch64-apple-ios)
+        run: cargo build -p rickynet-core --release --target aarch64-apple-ios
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked || cargo install cbindgen
+
+      - name: Generate C header + stage the static lib
+        run: |
+          set -euo pipefail
+          mkdir -p ios/Vendor/include ios/Vendor/lib
+          cbindgen --config rickynet-core/cbindgen.toml --crate rickynet-core \
+            --output ios/Vendor/include/rickynetcore.h
+          cp target/aarch64-apple-ios/release/librickynetcore.a ios/Vendor/lib/librickynetcore.a
+          echo "=== rickynetcore.h ==="; cat ios/Vendor/include/rickynetcore.h
+          echo "=== lib ==="; ls -l ios/Vendor/lib
+          # Confirm the C ABI symbols are actually in the archive.
+          nm ios/Vendor/lib/librickynetcore.a 2>/dev/null | grep -E '_rn_start|_rn_stop|_rn_stats' \
+            || (echo "ERROR: rn_* symbols missing from librickynetcore.a" && exit 1)
+
+      - name: Install XcodeGen + rasterizers
+        run: brew install xcodegen librsvg imagemagick
+
+      - name: Rasterize app icon set
+        run: bash ios/scripts/make-appicon.sh
+
+      - name: Generate Xcode project
+        run: cd ios && xcodegen generate
+
+      - name: Build unsigned RickyNet.app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/RickyNet.xcodeproj \
+            -scheme RickyNet \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath ios/build \
+            build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Verify icon embedded + package unsigned .ipa
+        run: |
+          set -euo pipefail
+          APP=$(find ios/build/Build/Products -maxdepth 3 -name 'RickyNet.app' -type d | head -1)
+          [ -n "$APP" ] || (echo "ERROR: RickyNet.app not found" && exit 1)
+          echo "app bundle: $APP"
+          ls -la "$APP"
+          # The compiled asset catalog (with the app icon) must be in the bundle.
+          [ -f "$APP/Assets.car" ] || (echo "ERROR: Assets.car (app icon) missing from bundle" && exit 1)
+          # Best-effort dump of the icon names actool baked in.
+          xcrun --sdk iphoneos assetutil --info "$APP/Assets.car" 2>/dev/null | grep -i -m1 appicon \
+            && echo "AppIcon present in Assets.car" || echo "(assetutil could not confirm, Assets.car present)"
+          # Package unsigned IPA.
+          rm -rf Payload RickyNet-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r RickyNet-unsigned.ipa Payload >/dev/null
+          echo "=== ipa ==="; ls -l RickyNet-unsigned.ipa
+          unzip -l RickyNet-unsigned.ipa | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RickyNet-unsigned-ipa
+          path: RickyNet-unsigned.ipa
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows: build rickynet.exe (GUI + headless), fetch the pinned wintun.dll,
+  # and upload both as a zip.
+  # ---------------------------------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build rickynet.exe (release)
+        run: cargo build -p rickynet-win --release
+
+      - name: Download pinned Wintun
+        shell: pwsh
+        run: |
+          $url = "https://www.wintun.net/builds/wintun-$env:WINTUN_VERSION.zip"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile wintun.zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun_extract -Force
+          $dll = Get-ChildItem -Path wintun_extract -Recurse -Filter wintun.dll |
+                 Where-Object { $_.FullName -match 'amd64' } | Select-Object -First 1
+          if (-not $dll) { throw "amd64 wintun.dll not found in archive" }
+          Copy-Item $dll.FullName -Destination target/release/wintun.dll -Force
+          Write-Host "Staged wintun.dll from $($dll.FullName)"
+
+      - name: Package rickynet.exe + wintun.dll
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/rickynet.exe dist/ -Force
+          Copy-Item target/release/wintun.dll   dist/ -Force
+          Get-ChildItem dist
+          Compress-Archive -Path dist/* -DestinationPath RickyNet-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RickyNet-windows
+          path: RickyNet-windows.zip
+          if-no-files-found: error

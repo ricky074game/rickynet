@@ -1,0 +1,13 @@
+[package]
+name = "rickynet-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RickyNet shared wire protocol: [u16 BE length][IP packet] framing + shared constants"
+
+[lib]
+name = "rickynet_wire"
+
+[dependencies]
+
+[dev-dependencies]

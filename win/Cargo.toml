@@ -1,0 +1,48 @@
+[package]
+name = "rickynet-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RickyNet Windows client: Wintun TUN <-> phone bridge with a small egui GUI (rickynet.exe)"
+
+[[bin]]
+name = "rickynet"
+path = "src/main.rs"
+
+# Cross-platform deps: the usbmux client, Wi-Fi transport and framing are plain
+# std::net + plist and build/test on any host (so the load-bearing usbmux logic
+# is unit-tested in CI on Linux too).
+[dependencies]
+rickynet-wire = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
+plist = "1"
+byteorder = "1"
+
+# GUI + Windows system integration. Only ships on Windows, so gate it there;
+# this also lets the crate compile on Linux/macOS (headless stub main) for
+# testing the portable modules without an X11/OpenGL toolchain.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tray-icon = "0.24"
+wintun = "0.5"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+# Unconditional so build.rs compiles on any host; the resource compiler is only
+# invoked when the target OS is Windows (see build.rs). Embeds the
+# requireAdministrator manifest + app .ico into rickynet.exe.
+[build-dependencies]
+embed-resource = "3"

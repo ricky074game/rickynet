@@ -1,0 +1,58 @@
+name: RickyNet
+options:
+  bundleIdPrefix: cafe.hiring
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  RickyNet:
+    type: application
+    platform: iOS
+    sources:
+      - Sources/RickyNet
+      - Resources/Assets.xcassets
+    # Link the Rust static lib built in CI *before* `xcodegen generate`.
+    # A `framework:` dependency accepts any file path and links it by direct
+    # reference; embed:false is required (app targets default embed:true, which
+    # would wrongly try to copy a .a into the bundle).
+    dependencies:
+      - framework: Vendor/lib/librickynetcore.a
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cafe.hiring.rickynet
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/RickyNet/RickyNet-Bridging-Header.h
+        LIBRARY_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Vendor/lib"]
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Vendor/include"]
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Free-provisioning / unsigned CI build. xcodebuild also passes
+        # CODE_SIGNING_ALLOWED=NO etc. on the command line.
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGN_IDENTITY: ""
+    info:
+      path: Sources/RickyNet/Info.plist
+      properties:
+        CFBundleDisplayName: RickyNet
+        CFBundleShortVersionString: "1.0.0"
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+
+schemes:
+  RickyNet:
+    build:
+      targets:
+        RickyNet: all
+    run:
+      config: Release
+    archive:
+      config: Release

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "rickynet-wire",
+    "rickynet-core",
+    "win",
+]
+# `win` is Windows-only (Wintun + win32). Exclude it from the default set so a
+# plain `cargo build` on Linux/macOS builds just the portable crates; CI builds
+# it explicitly with `cargo build -p rickynet-win` on a windows runner.
+default-members = [
+    "rickynet-wire",
+    "rickynet-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hiringcafe/rickynet"
+authors = ["RickyNet"]
+
+[workspace.dependencies]
+rickynet-wire = { path = "rickynet-wire" }
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

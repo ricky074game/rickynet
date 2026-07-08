@@ -1,0 +1,8 @@
+#pragma code_page(65001)
+
+// Embed the requireAdministrator manifest (resource type 24 = RT_MANIFEST,
+// id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID) so Windows prompts for UAC.
+1 24 "app.manifest"
+
+// App icon (taskbar / Explorer). The lowest-id icon becomes the exe icon.
+1 ICON "../assets/icon.ico"
