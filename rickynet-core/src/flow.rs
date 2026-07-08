@@ -1,13 +1,13 @@
 //! Per-flow handlers: each flow that `ipstack` terminates is re-originated as a
 //! real OS socket bound to cellular, then spliced back to the netstack socket.
 //!
-//! Byte-counter convention (as surfaced to the iOS UI via `rn_stats`):
-//!   * TX = bytes the desktop sent OUT to the internet (upload over cellular)
-//!   * RX = bytes received FROM the internet for the desktop (download)
-//! Counted at the real (cellular) socket, so it reflects actual phone-data use.
+//! Byte counting happens at the cable in `device.rs` (upload=TX, download=RX),
+//! so these handlers just move bytes and tear down cleanly. Both directions are
+//! raced with `select!`/`copy_bidirectional` so an idle or half-open flow is
+//! reaped (and its cellular fd freed) rather than leaked — important for UDP,
+//! which has no FIN, so a naive `join!` would wait forever after DNS replies.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,52 +16,31 @@ use ipstack::{IpNumber, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransp
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::egress;
-use crate::{RX_BYTES, TX_BYTES};
 
-const RELAY_BUF: usize = 16 * 1024;
 const ICMP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Copy `reader` -> `writer` to EOF, tallying bytes into `counter`.
-async fn pump<R, W>(mut reader: R, mut writer: W, counter: &'static AtomicU64) -> std::io::Result<()>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let mut buf = vec![0u8; RELAY_BUF];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n]).await?;
-        counter.fetch_add(n as u64, Ordering::Relaxed);
-    }
-    let _ = writer.shutdown().await;
-    Ok(())
-}
 
 /// A new TCP flow: dial the original destination over cellular, splice.
 pub async fn handle_tcp(tcp: IpStackTcpStream) {
     // For a TUN-intercepted flow, `peer_addr` is the address the desktop tried
     // to reach — i.e. the original destination we must re-originate to.
     let dst = tcp.peer_addr();
-    let real = match egress::connect_tcp_cellular(dst).await {
+    let mut real = match egress::connect_tcp_cellular(dst).await {
         Ok(s) => s,
         Err(e) => {
             log::debug!("TCP {dst}: cellular connect failed: {e}");
             return;
         }
     };
-    let (tcp_r, tcp_w) = tokio::io::split(tcp);
-    let (real_r, real_w) = tokio::io::split(real);
-    // upload (desktop -> internet) counts TX; download (internet -> desktop) counts RX.
-    let up = pump(tcp_r, real_w, &TX_BYTES);
-    let down = pump(real_r, tcp_w, &RX_BYTES);
-    let _ = tokio::join!(up, down);
+    let mut tcp = tcp;
+    // copy_bidirectional handles half-close correctly AND propagates an error
+    // (e.g. ipstack's idle timeout) by returning, so nothing is leaked.
+    if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut real).await {
+        log::debug!("TCP {dst}: relay ended: {e}");
+    }
 }
 
 /// A new UDP flow (includes DNS on :53): one real cellular UDP socket per flow,
-/// datagram-preserving relay in both directions.
+/// datagram-preserving relay in both directions, torn down when either side ends.
 pub async fn handle_udp(udp: IpStackUdpStream) {
     let dst = udp.peer_addr();
     let real = match egress::connect_udp_cellular(dst).await {
@@ -86,7 +65,6 @@ pub async fn handle_udp(udp: IpStackUdpStream) {
             if real_up.send(&buf[..n]).await.is_err() {
                 break;
             }
-            TX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         }
     };
     // internet -> desktop
@@ -100,10 +78,15 @@ pub async fn handle_udp(udp: IpStackUdpStream) {
             if udp_w.write_all(&buf[..n]).await.is_err() {
                 break;
             }
-            RX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         }
     };
-    tokio::join!(up, down);
+
+    // Whichever side ends first (ipstack's UDP idle timeout fires `up`) tears
+    // the flow down and drops the cellular socket — no fd leak.
+    tokio::select! {
+        _ = up => {}
+        _ = down => {}
+    }
 }
 
 /// A non-TCP/UDP flow. v1 handles IPv4 ICMP echo (ping): re-originate the echo
@@ -136,8 +119,6 @@ pub async fn handle_unknown(u: IpStackUnknownTransport) {
             let mut rbuf = vec![0u8; 2048];
             match tokio::time::timeout(ICMP_TIMEOUT, sock.recv_from(&mut rbuf)).await {
                 Ok(Ok((n, _))) if n > 0 => {
-                    TX_BYTES.fetch_add(echo_bytes.len() as u64, Ordering::Relaxed);
-                    RX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                     reply_to_desktop(&u, echo, &data);
                 }
                 // No reply from the real host within the timeout: let the

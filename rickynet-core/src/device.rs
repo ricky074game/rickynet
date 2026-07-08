@@ -5,17 +5,27 @@
 //!
 //! We split the accepted TCP stream into halves and run a reader task and a
 //! writer task that own the framing; `FramedDevice` itself is just the pair of
-//! channel endpoints ipstack polls. This keeps the framing state machine out of
-//! `poll_read`/`poll_write` (which would otherwise be error-prone) and lets
-//! `poll_write` be truly non-blocking (unbounded outgoing queue).
+//! channel endpoints ipstack polls. Byte counters are tallied here at the cable
+//! (reader = desktop upload = TX, writer = desktop download = RX); this is the
+//! meaningful "cellular data moved" figure and keeps the per-flow handlers free
+//! of counting.
+//!
+//! Disconnect handling (important): ipstack 1.0's device loop has no EOF branch
+//! — if `poll_read` reported EOF (`Ok` with 0 bytes) it would busy-loop at 100%
+//! CPU forever. So on peer disconnect we (a) return `Pending` from `poll_read`
+//! (ipstack's internal read task simply parks) and (b) fire a `oneshot` signal
+//! that `bridge()` selects on to drop the whole `IpStack` and reconnect.
 
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::{RX_BYTES, TX_BYTES};
 
 /// Backpressure bound for packets read off the cable and awaiting injection.
 const INCOMING_CAP: usize = 2048;
@@ -30,27 +40,33 @@ pub struct FramedDevice {
 
 impl FramedDevice {
     /// Wrap an accepted transport stream: spawn the reader/writer framing tasks
-    /// and return the device ipstack will drive. When the peer disconnects the
-    /// reader task ends, the incoming channel closes, and `poll_read` reports
-    /// EOF so the stack tears down cleanly.
-    pub fn new(stream: tokio::net::TcpStream) -> Self {
+    /// and return the device ipstack will drive, plus a disconnect receiver that
+    /// resolves when the peer goes away (the reader task ends and drops the
+    /// paired sender).
+    pub fn new(stream: tokio::net::TcpStream) -> (Self, oneshot::Receiver<()>) {
         let _ = stream.set_nodelay(true);
         let (rd, wr) = stream.into_split();
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(INCOMING_CAP);
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (disc_tx, disc_rx) = oneshot::channel::<()>();
 
-        tokio::spawn(reader_task(rd, in_tx));
+        tokio::spawn(reader_task(rd, in_tx, disc_tx));
         tokio::spawn(writer_task(wr, out_rx));
 
-        FramedDevice {
-            incoming: in_rx,
-            leftover: None,
-            outgoing: out_tx,
-        }
+        (
+            FramedDevice {
+                incoming: in_rx,
+                leftover: None,
+                outgoing: out_tx,
+            },
+            disc_rx,
+        )
     }
 }
 
-async fn reader_task(mut rd: OwnedReadHalf, tx: mpsc::Sender<Vec<u8>>) {
+async fn reader_task(mut rd: OwnedReadHalf, tx: mpsc::Sender<Vec<u8>>, _disc: oneshot::Sender<()>) {
+    // When this task returns (EOF/error/device dropped), `_disc` drops and the
+    // disconnect receiver in bridge() resolves.
     loop {
         // Framing: [u16 big-endian length][length bytes]. tokio's read_u16 is
         // big-endian, matching rickynet-wire.
@@ -62,6 +78,8 @@ async fn reader_task(mut rd: OwnedReadHalf, tx: mpsc::Sender<Vec<u8>>) {
         if rd.read_exact(&mut buf).await.is_err() {
             break;
         }
+        // Bytes the desktop sent out to the internet = upload = TX.
+        TX_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
         if tx.send(buf).await.is_err() {
             break; // device dropped
         }
@@ -81,7 +99,9 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Vec
         if wr.write_all(&pkt).await.is_err() {
             break;
         }
-        // Drain any immediately-available packets before flushing to coalesce.
+        // Bytes delivered back to the desktop = download = RX.
+        RX_BYTES.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+        // Coalesce: only flush when the queue has momentarily drained.
         if rx.is_empty() {
             if wr.flush().await.is_err() {
                 break;
@@ -114,8 +134,10 @@ impl AsyncRead for FramedDevice {
                 }
                 Poll::Ready(Ok(()))
             }
-            // Channel closed -> EOF (0 bytes filled).
-            Poll::Ready(None) => Poll::Ready(Ok(())),
+            // Channel closed (peer disconnected): DON'T report EOF — ipstack 1.0
+            // has no EOF branch and would busy-loop. Park instead; bridge()
+            // tears the whole stack down via the disconnect signal.
+            Poll::Ready(None) => Poll::Pending,
             Poll::Pending => Poll::Pending,
         }
     }

@@ -73,10 +73,18 @@ pub extern "C" fn rn_start(port: u16, transport: u32) -> i32 {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = stdmpsc::channel::<Result<(), String>>();
 
-    let handle = std::thread::Builder::new()
+    // Don't `.expect()` here: a panic would cross the extern "C" boundary and,
+    // with panic="abort", hard-kill the iOS app. Return an error code instead.
+    let handle = match std::thread::Builder::new()
         .name("rickynet-core".into())
         .spawn(move || run_runtime(port, transport, ready_tx, shutdown_rx))
-        .expect("spawn rickynet-core thread");
+    {
+        Ok(h) => h,
+        Err(e) => {
+            log::error!("rn_start: failed to spawn core thread: {e}");
+            return RN_ERR_RUNTIME;
+        }
+    };
 
     // Wait for the bind result so we can report a real success/failure.
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
@@ -212,9 +220,11 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
 }
 
 /// Drive one desktop connection: feed its framed IP packets into `ipstack` and
-/// hand each accepted flow to a per-flow handler.
+/// hand each accepted flow to a per-flow handler. Returns when the desktop
+/// disconnects (via the device's disconnect signal) so `serve()` can accept the
+/// next connection.
 async fn bridge(stream: tokio::net::TcpStream) {
-    let device = FramedDevice::new(stream);
+    let (device, mut disconnected) = FramedDevice::new(stream);
 
     let mut config = IpStackConfig::default();
     // Large device MTU so any single desktop packet fits in one read; TCP is
@@ -232,21 +242,30 @@ async fn bridge(stream: tokio::net::TcpStream) {
     let mut ip_stack = IpStack::new(config, device);
 
     loop {
-        match ip_stack.accept().await {
-            Ok(IpStackStream::Tcp(tcp)) => {
-                tokio::spawn(flow::handle_tcp(tcp));
-            }
-            Ok(IpStackStream::Udp(udp)) => {
-                tokio::spawn(flow::handle_udp(udp));
-            }
-            Ok(IpStackStream::UnknownTransport(u)) => {
-                tokio::spawn(flow::handle_unknown(u));
-            }
-            Ok(IpStackStream::UnknownNetwork(_)) => {}
-            Err(e) => {
-                // Device closed (desktop went away) or a fatal stack error.
-                log::debug!("ipstack accept ended: {e}");
+        tokio::select! {
+            // Desktop disconnected: drop `ip_stack` (its internal task aborts)
+            // and return so serve() can accept a reconnect.
+            _ = &mut disconnected => {
+                log::debug!("desktop disconnected; tearing down ipstack");
                 break;
+            }
+            accepted = ip_stack.accept() => {
+                match accepted {
+                    Ok(IpStackStream::Tcp(tcp)) => {
+                        tokio::spawn(flow::handle_tcp(tcp));
+                    }
+                    Ok(IpStackStream::Udp(udp)) => {
+                        tokio::spawn(flow::handle_udp(udp));
+                    }
+                    Ok(IpStackStream::UnknownTransport(u)) => {
+                        tokio::spawn(flow::handle_unknown(u));
+                    }
+                    Ok(IpStackStream::UnknownNetwork(_)) => {}
+                    Err(e) => {
+                        log::debug!("ipstack accept ended: {e}");
+                        break;
+                    }
+                }
             }
         }
     }

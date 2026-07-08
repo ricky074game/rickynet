@@ -8,6 +8,11 @@ fn main() {
         println!("cargo:rerun-if-changed=rickynet.rc");
         println!("cargo:rerun-if-changed=app.manifest");
         println!("cargo:rerun-if-changed=../assets/icon.ico");
-        embed_resource::compile("rickynet.rc", embed_resource::NONE);
+        // The requireAdministrator manifest is load-bearing — fail loudly if the
+        // resource embed doesn't happen (embed-resource 3.x returns a #[must_use]
+        // result instead of panicking).
+        embed_resource::compile("rickynet.rc", embed_resource::NONE)
+            .manifest_required()
+            .expect("failed to embed rickynet.rc (requireAdministrator manifest + app icon)");
     }
 }
