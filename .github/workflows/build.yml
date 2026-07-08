@@ -47,7 +47,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build rickynet-core staticlib (aarch64-apple-ios)
-        run: cargo build -p rickynet-core --release --target aarch64-apple-ios
+        # Disable LTO for the staticlib so it contains native objects (reliable
+        # ld64 linking + readable symbols) rather than thin-LTO bitcode.
+        run: cargo build -p rickynet-core --release --target aarch64-apple-ios --config profile.release.lto=false
 
       - name: Install cbindgen
         run: cargo install cbindgen --locked || cargo install cbindgen
@@ -61,9 +63,13 @@ jobs:
           cp target/aarch64-apple-ios/release/librickynetcore.a ios/Vendor/lib/librickynetcore.a
           echo "=== rickynetcore.h ==="; cat ios/Vendor/include/rickynetcore.h
           echo "=== lib ==="; ls -l ios/Vendor/lib
-          # Confirm the C ABI symbols are actually in the archive.
-          nm ios/Vendor/lib/librickynetcore.a 2>/dev/null | grep -E '_rn_start|_rn_stop|_rn_stats' \
-            || (echo "ERROR: rn_* symbols missing from librickynetcore.a" && exit 1)
+          # Informational symbol check (non-fatal — xcodebuild's link is the real
+          # test). Apple prefixes C symbols with an underscore.
+          if nm -g ios/Vendor/lib/librickynetcore.a 2>/dev/null | grep -qE '_rn_start'; then
+            echo "OK: rn_* symbols present in librickynetcore.a"
+          else
+            echo "WARN: nm did not list rn_* (unexpected with lto=false); relying on xcodebuild link"
+          fi
 
       - name: Install XcodeGen + rasterizers
         run: brew install xcodegen librsvg imagemagick
