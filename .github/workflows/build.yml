@@ -41,6 +41,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select newest installed Xcode
+        # brew's XcodeGen emits the latest project format (objectVersion 77);
+        # the runner's default Xcode (15.4) can't read it. Pick the newest Xcode
+        # present (16.x on macos-14) so xcodebuild understands the project.
+        run: |
+          set -e
+          latest=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Selecting $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
