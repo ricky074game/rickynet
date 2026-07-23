@@ -91,7 +91,52 @@ jobs:
       - name: Generate Xcode project
         run: cd ios && xcodegen generate
 
-      - name: Build unsigned RickyNet.app
+      # Import the KravaSign Distribution cert + Ad Hoc profile into a throwaway
+      # keychain so xcodebuild can sign. If the secrets aren't set (e.g. a fork
+      # PR, which can't read secrets), this no-ops and only the unsigned .ipa is
+      # produced. Secrets required: IOS_DIST_CERT_P12_BASE64,
+      # IOS_DIST_PROFILE_BASE64, IOS_CERT_PASSWORD.
+      - name: Import signing certificate & provisioning profile
+        env:
+          P12_B64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          PROFILE_B64: ${{ secrets.IOS_DIST_PROFILE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${P12_B64:-}" ] || [ -z "${PROFILE_B64:-}" ]; then
+            echo "::warning::iOS signing secrets not set — building UNSIGNED only."
+            echo "SIGN_AVAILABLE=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          CERT="$RUNNER_TEMP/dist.p12"
+          PROFILE="$RUNNER_TEMP/dist.mobileprovision"
+          printf '%s' "$P12_B64" | base64 --decode > "$CERT"
+          printf '%s' "$PROFILE_B64" | base64 --decode > "$PROFILE"
+
+          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
+          KPW="$(uuidgen)"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+          # Import key+cert; grant codesign access without an interactive prompt.
+          security import "$CERT" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KPW" "$KEYCHAIN" >/dev/null
+          # Put our keychain first in the search list so xcodebuild finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          echo "Signing identities available:"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          # Install the profile under its UUID (both classic + Xcode 16 locations).
+          UUID="$(security cms -D -i "$PROFILE" | plutil -extract UUID raw -)"
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$PROFILE" "$dir/$UUID.mobileprovision"
+          done
+          echo "Installed provisioning profile $UUID"
+          echo "SIGN_AVAILABLE=1" >> "$GITHUB_ENV"
+
+      - name: Build unsigned RickyNet.app (fallback for non-registered devices)
         run: |
           set -euo pipefail
           xcodebuild \
@@ -103,7 +148,9 @@ jobs:
             build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES
 
       - name: Verify icon embedded + package unsigned .ipa
@@ -130,6 +177,62 @@ jobs:
         with:
           name: RickyNet-unsigned-ipa
           path: RickyNet-unsigned.ipa
+          if-no-files-found: error
+
+      # Signed Ad Hoc build: archive with manual signing, then export an .ipa
+      # that installs directly on the KravaSign-registered device (UDID
+      # 00008150-0015392e3401401c) with no SideStore / 7-day re-sign.
+      - name: Archive signed app (Ad Hoc)
+        if: env.SIGN_AVAILABLE == '1'
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/RickyNet.xcodeproj \
+            -scheme RickyNet \
+            -sdk iphoneos \
+            -configuration Release \
+            -archivePath ios/RickyNet.xcarchive \
+            -derivedDataPath ios/ddata \
+            archive \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM=YJZ3RG72A6 \
+            PROVISIONING_PROFILE_SPECIFIER="00008150-0015392E3401401CW1H8GN" \
+            CODE_SIGN_IDENTITY="iPhone Distribution"
+
+      - name: Export Ad Hoc .ipa
+        if: env.SIGN_AVAILABLE == '1'
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>ad-hoc</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>YJZ3RG72A6</string>
+            <key>compileBitcode</key><false/>
+            <key>stripSwiftSymbols</key><true/>
+            <key>provisioningProfiles</key><dict>
+              <key>app.yellow2173.nadir6666</key>
+              <string>00008150-0015392E3401401CW1H8GN</string>
+            </dict>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath ios/RickyNet.xcarchive \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath ios/export
+          echo "=== export dir ==="; ls -l ios/export
+          IPA="$(find ios/export -maxdepth 1 -name '*.ipa' | head -1)"
+          [ -n "$IPA" ] || { echo "ERROR: no signed .ipa exported"; exit 1; }
+          cp "$IPA" RickyNet-signed-adhoc.ipa
+          echo "signed ipa: $(ls -l RickyNet-signed-adhoc.ipa)"
+
+      - uses: actions/upload-artifact@v4
+        if: env.SIGN_AVAILABLE == '1'
+        with:
+          name: RickyNet-signed-adhoc-ipa
+          path: RickyNet-signed-adhoc.ipa
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------

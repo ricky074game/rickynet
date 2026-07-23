@@ -28,3 +28,11 @@ wintun.zip
 *.swp
 .idea/
 .vscode/
+
+# iOS signing material — NEVER commit
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.p8
+AuthKey_*.p8
