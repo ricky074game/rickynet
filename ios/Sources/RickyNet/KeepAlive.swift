@@ -1,87 +1,128 @@
 //
 //  KeepAlive.swift
-//  Keeps RickyNet running in the background while the tunnel is up.
+//  Keeps RickyNet running in the background while the tunnel is up, and turns
+//  OFF completely (releasing the audio session) when it isn't.
 //
 //  iOS suspends a foreground app the moment it's backgrounded or the screen
 //  locks — which killed the tunnel (see the ~37 s freeze in early logs). To
-//  survive that, we play a SILENT, looping audio track under the `audio`
-//  background mode (declared in Info.plist). iOS then treats RickyNet like a
-//  music app and keeps it (and its socket server) alive across app-switching
-//  and screen-lock. `.mixWithOthers` means it never interrupts the user's own
-//  music or podcasts, and the samples are zero + volume 0 so nothing is heard.
+//  survive that, we play a SILENT, looping track under the `audio` background
+//  mode (declared in Info.plist). iOS then treats RickyNet like a music app and
+//  keeps it (and its socket server) alive across app-switching and screen-lock.
+//  `.mixWithOthers` means it never interrupts the user's own music, and the
+//  samples are zero + volume 0 so nothing is heard.
 //
-//  This is a deliberate keep-alive hack, appropriate for a sideloaded personal
-//  tool. It is not bulletproof: under heavy memory pressure iOS can still
-//  reclaim the app, and an audio interruption (e.g. a phone call) is handled by
-//  resuming playback when it ends.
+//  "Prevent shutdown": background audio can be silently torn down by the system
+//  — an audio interruption (phone call), an output route change (headphones
+//  unplugged), or a media-services reset. Each of those would let iOS suspend
+//  the app. We observe all three and re-establish playback, so the tunnel stays
+//  up. `start()`/`stop()` are the complete on/off — `stop()` releases the
+//  session so, when off, the phone is fully back to normal (no background work,
+//  no held audio session, screen sleeps as usual).
 //
 
 import AVFoundation
 import Foundation
 
-final class KeepAlive {
+final class KeepAlive: NSObject {
     private var player: AVAudioPlayer?
-    private var observing = false
+    private(set) var active = false
 
-    /// Begin background survival. Safe to call repeatedly.
+    /// Turn background survival ON. Idempotent.
     func start() {
-        guard player == nil else { return }
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try session.setActive(true)
-
-            let p = try AVAudioPlayer(contentsOf: Self.silentClipURL())
-            p.numberOfLoops = -1 // loop forever
-            p.volume = 0
-            p.prepareToPlay()
-            p.play()
-            player = p
-
-            if !observing {
-                NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(handleInterruption(_:)),
-                    name: AVAudioSession.interruptionNotification,
-                    object: session
-                )
-                observing = true
-            }
-            LogStore.shared.app("keep-alive: silent audio started — background survival ON")
-        } catch {
-            LogStore.shared.app("keep-alive: FAILED to start (\(error.localizedDescription)); app is foreground-only")
-        }
+        guard !active else { return }
+        active = true
+        activateSession()
+        buildAndPlay()
+        registerObservers()
+        LogStore.shared.app("keep-alive: ON — background survival engaged")
     }
 
-    /// End background survival and release the audio session.
+    /// Turn background survival OFF completely: stop playback, drop observers,
+    /// and deactivate the audio session so nothing lingers in the background.
     func stop() {
-        guard player != nil else { return }
+        guard active else { return }
+        active = false
+        NotificationCenter.default.removeObserver(self)
         player?.stop()
         player = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-        LogStore.shared.app("keep-alive: silent audio stopped — background survival OFF")
+        LogStore.shared.app("keep-alive: OFF — audio session released, fully stopped")
     }
 
-    /// A phone call etc. interrupts playback; resume when it ends so we don't
-    /// silently lose background time.
-    @objc private func handleInterruption(_ note: Notification) {
-        guard
-            let info = note.userInfo,
-            let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-            let type = AVAudioSession.InterruptionType(rawValue: raw)
-        else { return }
-        switch type {
-        case .began:
-            LogStore.shared.app("keep-alive: audio interrupted (background survival paused)")
-        case .ended:
-            guard player != nil else { return }
-            try? AVAudioSession.sharedInstance().setActive(true)
-            player?.play()
-            LogStore.shared.app("keep-alive: audio resumed after interruption")
-        @unknown default:
-            break
+    // MARK: - Audio session / player
+
+    private func activateSession() {
+        do {
+            let s = AVAudioSession.sharedInstance()
+            try s.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try s.setActive(true)
+        } catch {
+            LogStore.shared.app("keep-alive: session activate failed: \(error.localizedDescription)")
         }
     }
+
+    private func buildAndPlay() {
+        do {
+            let p = try AVAudioPlayer(contentsOf: Self.silentClipURL())
+            p.numberOfLoops = -1 // loop forever
+            p.volume = 0
+            p.delegate = self
+            p.prepareToPlay()
+            p.play()
+            player = p
+        } catch {
+            LogStore.shared.app("keep-alive: player failed: \(error.localizedDescription); app is foreground-only")
+        }
+    }
+
+    // MARK: - Robustness: re-establish on the events that kill background audio
+
+    private func registerObservers() {
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(onInterruption(_:)),
+                       name: AVAudioSession.interruptionNotification, object: nil)
+        nc.addObserver(self, selector: #selector(onRouteChange(_:)),
+                       name: AVAudioSession.routeChangeNotification, object: nil)
+        nc.addObserver(self, selector: #selector(onMediaReset(_:)),
+                       name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
+    }
+
+    /// Phone call etc.: resume when it ends so we don't lose background time.
+    @objc private func onInterruption(_ note: Notification) {
+        guard active,
+              let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw)
+        else { return }
+        if type == .ended {
+            activateSession()
+            player?.play()
+            LogStore.shared.app("keep-alive: resumed after interruption")
+        } else {
+            LogStore.shared.app("keep-alive: audio interrupted (will resume)")
+        }
+    }
+
+    /// Route changes (e.g. headphones unplugged) can pause playback — re-assert.
+    @objc private func onRouteChange(_ note: Notification) {
+        guard active else { return }
+        if player?.isPlaying == false {
+            activateSession()
+            player?.play()
+            LogStore.shared.app("keep-alive: re-asserted playback after route change")
+        }
+    }
+
+    /// The media server died: session + player are now invalid — rebuild them,
+    /// otherwise iOS would suspend the app.
+    @objc private func onMediaReset(_ note: Notification) {
+        guard active else { return }
+        LogStore.shared.app("keep-alive: media services reset — rebuilding audio")
+        player = nil
+        activateSession()
+        buildAndPlay()
+    }
+
+    // MARK: - Silent clip
 
     /// A tiny silent 16-bit PCM WAV (mono, 8 kHz, 0.5 s), written to a temp file
     /// once. Built by hand so no audio asset needs bundling.
@@ -109,5 +150,20 @@ final class KeepAlive {
 
         try? d.write(to: url)
         return url
+    }
+}
+
+extension KeepAlive: AVAudioPlayerDelegate {
+    /// Shouldn't happen with an infinite loop, but if playback ever ends,
+    /// restart so background survival isn't lost.
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard active else { return }
+        buildAndPlay()
+    }
+
+    func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        guard active else { return }
+        LogStore.shared.app("keep-alive: decode error — restarting playback")
+        buildAndPlay()
     }
 }
