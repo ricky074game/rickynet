@@ -45,6 +45,9 @@ impl log::Log for CoreLogger {
     }
 
     fn log(&self, record: &log::Record) {
+        if !target_allowed(record.target(), record.level()) {
+            return;
+        }
         let elapsed = START.get_or_init(Instant::now).elapsed();
         let line = format!(
             "[{:>9.3}s {:5} {}] {}",
@@ -70,6 +73,22 @@ impl log::Log for CoreLogger {
     }
 
     fn flush(&self) {}
+}
+
+/// Per-target verbosity gate. Our own crates (`rickynet*`) log at full detail,
+/// but noisy dependencies — above all `ipstack`, which emits a line for EVERY
+/// TCP packet/session at debug — are clamped to WARN. Without this, a busy
+/// browsing session produces ~200 lines/sec, and every line calls back into the
+/// Swift sink and hops the main thread, starving the app (observed: the log
+/// pipeline, not the network, was the bottleneck). `rn_log_set_level` still
+/// controls the global gate on top of this.
+fn target_allowed(target: &str, level: log::Level) -> bool {
+    let threshold = if target.starts_with("rickynet") {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Warn
+    };
+    level <= threshold
 }
 
 fn emit(cb: RnLogCallback, line: &str) {

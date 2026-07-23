@@ -20,6 +20,12 @@ final class LogStore: ObservableObject {
     let fileURL: URL
     private let queue = DispatchQueue(label: "net.ricky.rickynet.logstore")
     private var handle: FileHandle?
+    // UI updates are coalesced: lines land in `uiBuffer` on `queue` and are
+    // flushed to the @Published array at most ~5x/sec, so even a burst of log
+    // lines can never flood the main thread (that flooding was what made the
+    // app crawl). File writes still happen per line on `queue`.
+    private var uiBuffer: [String] = []
+    private var flushScheduled = false
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -56,12 +62,29 @@ final class LogStore: ObservableObject {
             if let data = (line + "\n").data(using: .utf8) {
                 try? self.handle?.write(contentsOf: data)
             }
+            self.uiBuffer.append(line)
+            if !self.flushScheduled {
+                self.flushScheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    self?.flushUI()
+                }
+            }
         }
-        DispatchQueue.main.async { [weak self] in
+    }
+
+    /// Publish the buffered lines to the UI in one batch.
+    private func flushUI() {
+        queue.async { [weak self] in
             guard let self else { return }
-            self.lines.append(line)
-            if self.lines.count > self.maxLines {
-                self.lines.removeFirst(self.lines.count - self.maxLines)
+            self.flushScheduled = false
+            let batch = self.uiBuffer
+            self.uiBuffer.removeAll(keepingCapacity: true)
+            guard !batch.isEmpty else { return }
+            DispatchQueue.main.async {
+                self.lines.append(contentsOf: batch)
+                if self.lines.count > self.maxLines {
+                    self.lines.removeFirst(self.lines.count - self.maxLines)
+                }
             }
         }
     }
@@ -69,6 +92,7 @@ final class LogStore: ObservableObject {
     func clear() {
         queue.async { [weak self] in
             guard let self else { return }
+            self.uiBuffer.removeAll(keepingCapacity: true)
             try? self.handle?.truncate(atOffset: 0)
             try? self.handle?.seek(toOffset: 0)
         }
