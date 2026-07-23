@@ -54,8 +54,16 @@ impl Routes {
         if let Some(ip) = carve_out {
             match best_route_to(ip.octets()) {
                 Ok(hop) => {
+                    log::debug!(
+                        "routes: best hop to {ip}: gateway {:?} luid {:#x}",
+                        hop.gateway,
+                        hop.iface_luid
+                    );
                     match add_gateway_route(hop.iface_luid, ip.octets(), 32, hop.gateway, 1) {
-                        Ok(row) => rows.push(row),
+                        Ok(row) => {
+                            log::info!("routes: carve-out {ip}/32 via physical interface added");
+                            rows.push(row);
+                        }
                         Err(e) => log::warn!("carve-out /32 for {ip} failed: {e}"),
                     }
                 }
@@ -65,16 +73,24 @@ impl Routes {
 
         // Split-default on the tunnel adapter (on-link).
         match add_onlink_route(tun_luid, [0, 0, 0, 0], 1, 5) {
-            Ok(row) => rows.push(row),
+            Ok(row) => {
+                log::info!("routes: 0.0.0.0/1 -> tunnel added");
+                rows.push(row);
+            }
             Err(e) => {
+                log::error!("routes: adding 0.0.0.0/1 failed: {e}");
                 let r = Routes { rows };
                 r.remove();
                 return Err(e);
             }
         }
         match add_onlink_route(tun_luid, [128, 0, 0, 0], 1, 5) {
-            Ok(row) => rows.push(row),
+            Ok(row) => {
+                log::info!("routes: 128.0.0.0/1 -> tunnel added");
+                rows.push(row);
+            }
             Err(e) => {
+                log::error!("routes: adding 128.0.0.0/1 failed: {e}");
                 let r = Routes { rows };
                 r.remove();
                 return Err(e);
@@ -87,9 +103,20 @@ impl Routes {
     /// Delete every route we added. Best-effort (logs failures).
     pub fn remove(self) {
         for row in &self.rows {
+            let dest = unsafe { row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr }.to_ne_bytes();
+            let prefix = row.DestinationPrefix.PrefixLength;
             let rc = unsafe { DeleteIpForwardEntry2(row) };
             if rc != NO_ERROR {
-                log::warn!("delete route failed: {}", err(rc));
+                log::warn!(
+                    "delete route {}.{}.{}.{}/{prefix} failed: {}",
+                    dest[0], dest[1], dest[2], dest[3],
+                    err(rc)
+                );
+            } else {
+                log::debug!(
+                    "routes: {}.{}.{}.{}/{prefix} removed",
+                    dest[0], dest[1], dest[2], dest[3]
+                );
             }
         }
     }

@@ -37,8 +37,8 @@ pub fn run(args: Args, elevated: bool) {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 440.0])
-            .with_min_inner_size([340.0, 400.0])
+            .with_inner_size([360.0, 540.0])
+            .with_min_inner_size([340.0, 460.0])
             .with_icon(icon::egui_icon())
             .with_title("RickyNet"),
         ..Default::default()
@@ -120,8 +120,10 @@ impl App {
 
     fn toggle_connection(&mut self) {
         if self.busy() {
+            log::info!("ui: disconnect clicked");
             self.shared.request_stop();
         } else {
+            log::info!("ui: connect clicked");
             self.start_worker();
         }
     }
@@ -146,6 +148,12 @@ impl App {
         } else {
             args.phone_ip = None;
         }
+        log::info!(
+            "ui: starting worker (transport {}, port {}, phone_ip {:?})",
+            args.transport.label(),
+            args.port,
+            args.phone_ip
+        );
         let shared = self.shared.clone();
         self.worker = Some(std::thread::spawn(move || worker::run_connect(shared, args)));
     }
@@ -343,8 +351,36 @@ impl App {
         // --- Status log ---
         ui.add_space(8.0);
         ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Log").strong());
+            if ui
+                .small_button("Open log file")
+                .on_hover_text(
+                    crate::logging::log_file_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "no log file".to_string()),
+                )
+                .clicked()
+            {
+                if let Some(path) = crate::logging::log_file_path() {
+                    log::info!("ui: opening log file {}", path.display());
+                    let _ = std::process::Command::new("notepad").arg(path).spawn();
+                }
+            }
+            if ui.small_button("Copy").clicked() {
+                let text = self.shared.logs().join("\n");
+                ui.output_mut(|o| o.copied_text = text);
+            }
+        });
+        if let Some(path) = crate::logging::log_file_path() {
+            ui.label(
+                RichText::new(format!("full log: {}", path.display()))
+                    .small()
+                    .weak(),
+            );
+        }
         egui::ScrollArea::vertical()
-            .max_height(96.0)
+            .max_height(140.0)
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {

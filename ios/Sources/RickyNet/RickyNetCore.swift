@@ -32,22 +32,32 @@ final class RickyNetCore: ObservableObject {
 
     var isRunning: Bool { status == .running }
 
+    init() {
+        // Route every Rust core log line into LogStore (and its file) before
+        // anything else can run.
+        LogStore.installCoreLogHook()
+    }
+
     func start() {
         // transport: 0 = bind 127.0.0.1 (USB/loopback only), 1 = bind 0.0.0.0.
         let transport: UInt32 = allowWifi ? 1 : 0
+        LogStore.shared.app("start tapped (port \(port), transport \(transport == 0 ? "USB/loopback" : "USB+Wi-Fi"))")
         let rc = rn_start(port, transport)
         if rc == 0 {
+            LogStore.shared.app("core started OK")
             status = .running
             // Keep the screen (and thus the app + its socket server) awake.
             UIApplication.shared.isIdleTimerDisabled = true
             startPolling()
         } else {
+            LogStore.shared.app("core start FAILED: rc=\(rc) (\(Self.describe(rc)))")
             status = .error(Self.describe(rc))
         }
     }
 
     func stop() {
-        _ = rn_stop()
+        let rc = rn_stop()
+        LogStore.shared.app("stop tapped (rn_stop rc=\(rc); session rx \(rxBytes) B, tx \(txBytes) B)")
         UIApplication.shared.isIdleTimerDisabled = false
         stopPolling()
         rxBytes = 0

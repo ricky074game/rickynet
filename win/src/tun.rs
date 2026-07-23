@@ -41,6 +41,7 @@ impl Tun {
         mtu: usize,
     ) -> io::Result<Tun> {
         let dll = dll_path();
+        log::debug!("tun: loading {}", dll.display());
         let wintun = unsafe { wintun::load_from_path(&dll) }.map_err(|e| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -54,21 +55,32 @@ impl Tun {
         // Reuse an existing "RickyNet" adapter if present, else create one. This
         // keeps a crash from accumulating adapters.
         let adapter = match wintun::Adapter::open(&wintun, name) {
-            Ok(a) => a,
-            Err(_) => wintun::Adapter::create(&wintun, name, "RickyNet", None)
-                .map_err(map_err("create Wintun adapter"))?,
+            Ok(a) => {
+                log::info!("tun: reusing existing adapter '{name}'");
+                a
+            }
+            Err(open_err) => {
+                log::debug!("tun: no existing adapter '{name}' ({open_err}); creating");
+                let a = wintun::Adapter::create(&wintun, name, "RickyNet", None)
+                    .map_err(map_err("create Wintun adapter"))?;
+                log::info!("tun: created adapter '{name}'");
+                a
+            }
         };
 
         adapter
             .set_network_addresses_tuple(IpAddr::V4(address), IpAddr::V4(mask), None)
             .map_err(map_err("set adapter address"))?;
+        log::debug!("tun: address {address}/{mask} set");
         if !dns.is_empty() {
-            if let Err(e) = adapter.set_dns_servers(dns) {
-                log::warn!("set DNS servers failed (continuing): {e}");
+            match adapter.set_dns_servers(dns) {
+                Ok(()) => log::debug!("tun: DNS servers set to {dns:?}"),
+                Err(e) => log::warn!("set DNS servers failed (continuing): {e}"),
             }
         }
-        if let Err(e) = adapter.set_mtu(mtu) {
-            log::warn!("set MTU failed (continuing): {e}");
+        match adapter.set_mtu(mtu) {
+            Ok(()) => log::debug!("tun: MTU set to {mtu}"),
+            Err(e) => log::warn!("set MTU failed (continuing): {e}"),
         }
 
         let luid = unsafe { adapter.get_luid().Value };
@@ -77,6 +89,7 @@ impl Tun {
                 .start_session(RING_CAPACITY)
                 .map_err(map_err("start Wintun session"))?,
         );
+        log::info!("tun: session started (luid {luid:#x}, ring {RING_CAPACITY} bytes)");
 
         Ok(Tun {
             _wintun: wintun,

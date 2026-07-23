@@ -6,10 +6,14 @@
 //! raced with `select!`/`copy_bidirectional` so an idle or half-open flow is
 //! reaped (and its cellular fd freed) rather than leaked — important for UDP,
 //! which has no FIN, so a naive `join!` would wait forever after DNS replies.
+//!
+//! Every flow gets a monotonically-increasing id (`TCP#7`, `UDP#12`) so its
+//! open/close/error lines can be correlated in the log.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use etherparse::{Icmpv4Header, Icmpv4Type};
 use ipstack::{IpNumber, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
@@ -19,40 +23,75 @@ use crate::egress;
 
 const ICMP_TIMEOUT: Duration = Duration::from_secs(2);
 
+static NEXT_FLOW_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    NEXT_FLOW_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A new TCP flow: dial the original destination over cellular, splice.
 pub async fn handle_tcp(tcp: IpStackTcpStream) {
+    let id = next_id();
     // For a TUN-intercepted flow, `peer_addr` is the address the desktop tried
     // to reach — i.e. the original destination we must re-originate to.
     let dst = tcp.peer_addr();
+    let src = tcp.local_addr();
+    log::debug!("TCP#{id}: open {src} -> {dst}, dialing over cellular");
+    let t0 = Instant::now();
     let mut real = match egress::connect_tcp_cellular(dst).await {
         Ok(s) => s,
         Err(e) => {
-            log::debug!("TCP {dst}: cellular connect failed: {e}");
+            log::warn!(
+                "TCP#{id} {dst}: cellular connect failed after {:.1?}: {e} (kind {:?})",
+                t0.elapsed(),
+                e.kind()
+            );
             return;
         }
     };
+    log::debug!(
+        "TCP#{id} {dst}: cellular connected in {:.1?} (local {:?})",
+        t0.elapsed(),
+        real.local_addr().ok()
+    );
     let mut tcp = tcp;
     // copy_bidirectional handles half-close correctly AND propagates an error
     // (e.g. ipstack's idle timeout) by returning, so nothing is leaked.
-    if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut real).await {
-        log::debug!("TCP {dst}: relay ended: {e}");
+    match tokio::io::copy_bidirectional(&mut tcp, &mut real).await {
+        Ok((up, down)) => log::debug!(
+            "TCP#{id} {dst}: closed after {:.1?} (up {up} B, down {down} B)",
+            t0.elapsed()
+        ),
+        Err(e) => log::debug!(
+            "TCP#{id} {dst}: relay ended after {:.1?}: {e} (kind {:?})",
+            t0.elapsed(),
+            e.kind()
+        ),
     }
 }
 
 /// A new UDP flow (includes DNS on :53): one real cellular UDP socket per flow,
 /// datagram-preserving relay in both directions, torn down when either side ends.
 pub async fn handle_udp(udp: IpStackUdpStream) {
+    let id = next_id();
     let dst = udp.peer_addr();
+    let src = udp.local_addr();
+    log::debug!("UDP#{id}: open {src} -> {dst}");
+    let t0 = Instant::now();
     let real = match egress::connect_udp_cellular(dst).await {
         Ok(s) => s,
         Err(e) => {
-            log::debug!("UDP {dst}: cellular socket failed: {e}");
+            log::warn!("UDP#{id} {dst}: cellular socket failed: {e} (kind {:?})", e.kind());
             return;
         }
     };
     let real = Arc::new(real);
     let real_up = real.clone();
     let (mut udp_r, mut udp_w) = tokio::io::split(udp);
+
+    let up_bytes = Arc::new(AtomicU64::new(0));
+    let down_bytes = Arc::new(AtomicU64::new(0));
+    let (up_ctr, down_ctr) = (up_bytes.clone(), down_bytes.clone());
 
     // desktop -> internet
     let up = async move {
@@ -65,6 +104,7 @@ pub async fn handle_udp(udp: IpStackUdpStream) {
             if real_up.send(&buf[..n]).await.is_err() {
                 break;
             }
+            up_ctr.fetch_add(n as u64, Ordering::Relaxed);
         }
     };
     // internet -> desktop
@@ -78,15 +118,22 @@ pub async fn handle_udp(udp: IpStackUdpStream) {
             if udp_w.write_all(&buf[..n]).await.is_err() {
                 break;
             }
+            down_ctr.fetch_add(n as u64, Ordering::Relaxed);
         }
     };
 
     // Whichever side ends first (ipstack's UDP idle timeout fires `up`) tears
     // the flow down and drops the cellular socket — no fd leak.
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
-    }
+    let ended_by = tokio::select! {
+        _ = up => "desktop side",
+        _ = down => "internet side",
+    };
+    log::debug!(
+        "UDP#{id} {dst}: closed by {ended_by} after {:.1?} (up {} B, down {} B)",
+        t0.elapsed(),
+        up_bytes.load(Ordering::Relaxed),
+        down_bytes.load(Ordering::Relaxed)
+    );
 }
 
 /// A non-TCP/UDP flow. v1 handles IPv4 ICMP echo (ping): re-originate the echo
@@ -103,14 +150,21 @@ pub async fn handle_unknown(u: IpStackUnknownTransport) {
     };
     let (hdr, data) = match Icmpv4Header::from_slice(u.payload()) {
         Ok(x) => x,
-        Err(_) => return,
+        Err(e) => {
+            log::debug!("ICMP: unparseable ICMPv4 header from desktop: {e:?}");
+            return;
+        }
     };
     let echo = match hdr.icmp_type {
         Icmpv4Type::EchoRequest(e) => e,
-        _ => return,
+        other => {
+            log::debug!("ICMP: ignoring non-echo type {other:?}");
+            return;
+        }
     };
     let echo_bytes = u.payload().to_vec();
     let data = data.to_vec();
+    log::debug!("ICMP: echo request for {dst} ({} payload bytes)", data.len());
 
     // Try a genuine round-trip over cellular.
     if let Some(sock) = egress::icmp_v4_socket_cellular() {
@@ -119,18 +173,24 @@ pub async fn handle_unknown(u: IpStackUnknownTransport) {
             let mut rbuf = vec![0u8; 2048];
             match tokio::time::timeout(ICMP_TIMEOUT, sock.recv_from(&mut rbuf)).await {
                 Ok(Ok((n, _))) if n > 0 => {
+                    log::debug!("ICMP: {dst} answered ({n} bytes); relaying echo reply");
                     reply_to_desktop(&u, echo, &data);
                 }
                 // No reply from the real host within the timeout: let the
                 // desktop's ping time out naturally (honest — host unreachable).
-                _ => {}
+                _ => {
+                    log::debug!("ICMP: no reply from {dst} within {ICMP_TIMEOUT:?}");
+                }
             }
+        } else {
+            log::debug!("ICMP: send_to {dst} failed");
         }
         return;
     }
 
     // No unprivileged ICMP socket on this platform (e.g. a hardened Linux host
     // in CI): answer locally so a tunnel-liveness ping still succeeds.
+    log::debug!("ICMP: answering echo for {dst} locally (no ICMP socket)");
     reply_to_desktop(&u, echo, &data);
 }
 

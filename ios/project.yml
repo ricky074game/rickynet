@@ -46,6 +46,10 @@ targets:
           - UIInterfaceOrientationPortrait
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
+        # Expose Documents/ (rickynet.log) in the Files app so a tester can
+        # retrieve the log even without the in-app share button.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
 
 schemes:
   RickyNet:

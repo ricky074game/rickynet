@@ -39,7 +39,19 @@ pub fn connect(kind: TransportKind, phone_ip: Option<&str>, port: u16) -> io::Re
                     "Wi-Fi transport requires --phone-ip",
                 )
             })?;
-            let stream = TcpStream::connect((ip, port))?;
+            log::info!("wifi transport: dialing {ip}:{port}");
+            let stream = TcpStream::connect((ip, port)).map_err(|e| {
+                log::error!(
+                    "wifi transport: connect to {ip}:{port} failed: {e} — is the app open, \
+                     Started, and 'Accept over Wi-Fi' enabled on the phone?"
+                );
+                e
+            })?;
+            log::info!(
+                "wifi transport: connected (local {:?} -> peer {:?})",
+                stream.local_addr().ok(),
+                stream.peer_addr().ok()
+            );
             stream.set_nodelay(true).ok();
             // The pump blocks on reads; make sure no timeout is inherited.
             stream.set_read_timeout(None).ok();

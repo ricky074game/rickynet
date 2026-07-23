@@ -7,6 +7,8 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var core = RickyNetCore()
+    @ObservedObject private var logs = LogStore.shared
+    @State private var showLogs = false
 
     var body: some View {
         VStack(spacing: 28) {
@@ -30,6 +32,12 @@ struct ContentView: View {
 
             counters
 
+            Button(action: { showLogs = true }) {
+                Label("Logs (\(logs.lines.count))", systemImage: "doc.text.magnifyingglass")
+                    .font(.callout)
+            }
+            .buttonStyle(.bordered)
+
             Spacer()
 
             Text("Keep this screen open. RickyNet is foreground-only — if you\nswitch apps or lock the phone, the link drops.")
@@ -40,6 +48,9 @@ struct ContentView: View {
                 .padding(.bottom, 8)
         }
         .padding(.top, 40)
+        .sheet(isPresented: $showLogs) {
+            LogView()
+        }
     }
 
     private var header: some View {

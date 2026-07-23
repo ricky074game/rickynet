@@ -91,6 +91,22 @@ the **same LAN**.
 | Link drops after a bit | The iPhone app was backgrounded or the phone locked — bring RickyNet back to the foreground and Start again. |
 | Slow | Expected — userspace re-origination on the phone. Fine for browsing, not line-rate. |
 
+## Getting logs (send these when reporting a problem)
+
+Both sides log **everything** by default (debug level) — always grab BOTH files:
+
+- **Windows:** `%LOCALAPPDATA%\RickyNet\rickynet.log` (falls back to the folder
+  next to `rickynet.exe`, then the temp dir). The GUI shows the path under the
+  log panel and has **Open log file** / **Copy** buttons. Rotates to
+  `rickynet.old.log` at ~5 MB — include that too if it exists.
+  `RUST_LOG` (e.g. `RUST_LOG=trace`) overrides verbosity.
+- **iPhone:** in the app tap **Logs** → the share icon to send `rickynet.log`
+  (AirDrop/Messages/Mail). The same file is also visible in the **Files app →
+  On My iPhone → RickyNet**. Rotates to `rickynet.old.log` at ~4 MB.
+
+Reproduce the problem first, then share the logs right away (connect attempt,
+flow errors, and a 15-second traffic heartbeat are all recorded).
+
 ## What "clean shutdown" does
 Disconnecting removes the two split-default routes (and, for Wi-Fi, the phone's
 `/32` carve-out) and drops the Wintun adapter, which restores your normal routing

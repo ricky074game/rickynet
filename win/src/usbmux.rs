@@ -103,7 +103,14 @@ fn recv_plist<R: Read>(r: &mut R) -> io::Result<plist::Value> {
 }
 
 fn connect_muxd() -> io::Result<TcpStream> {
-    let s = TcpStream::connect(("127.0.0.1", USBMUXD_PORT))?;
+    log::debug!("usbmux: connecting to Apple Mobile Device Service at 127.0.0.1:{USBMUXD_PORT}");
+    let s = TcpStream::connect(("127.0.0.1", USBMUXD_PORT)).map_err(|e| {
+        log::error!(
+            "usbmux: cannot reach 127.0.0.1:{USBMUXD_PORT}: {e} — is iTunes / Apple \
+             Devices installed and the Apple Mobile Device Service running?"
+        );
+        e
+    })?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
     Ok(s)
@@ -112,9 +119,15 @@ fn connect_muxd() -> io::Result<TcpStream> {
 /// Query connected USB devices.
 pub fn list_devices() -> io::Result<Vec<DeviceInfo>> {
     let mut s = connect_muxd()?;
+    log::debug!("usbmux: sending ListDevices");
     send_plist(&mut s, 1, &base_message("ListDevices"))?;
     let resp = recv_plist(&mut s)?;
-    Ok(parse_device_list(&resp))
+    let devices = parse_device_list(&resp);
+    log::info!("usbmux: {} USB device(s) attached", devices.len());
+    for d in &devices {
+        log::debug!("usbmux:   device id {} serial {}", d.device_id, d.serial);
+    }
+    Ok(devices)
 }
 
 fn parse_device_list(resp: &plist::Value) -> Vec<DeviceInfo> {
@@ -158,6 +171,10 @@ fn parse_device_list(resp: &plist::Value) -> Vec<DeviceInfo> {
 /// stream is a raw pipe to the device port (usbmux framing is done).
 pub fn connect_device(device_id: u64, port: u16) -> io::Result<TcpStream> {
     let mut s = connect_muxd()?;
+    log::debug!(
+        "usbmux: Connect device {device_id} port {port} (network-order {})",
+        port_network_order(port)
+    );
     let mut d = base_message("Connect");
     d.insert("DeviceID".into(), plist::Value::from(device_id));
     d.insert(
@@ -171,6 +188,7 @@ pub fn connect_device(device_id: u64, port: u16) -> io::Result<TcpStream> {
         .and_then(|d| d.get("Number"))
         .and_then(as_u64)
         .unwrap_or(u64::MAX);
+    log::debug!("usbmux: Connect result Number={number}");
     if number != 0 {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
@@ -183,6 +201,7 @@ pub fn connect_device(device_id: u64, port: u16) -> io::Result<TcpStream> {
     // Hand back a blocking raw pipe.
     s.set_read_timeout(None)?;
     s.set_write_timeout(None)?;
+    log::info!("usbmux: tunnel to device {device_id} port {port} established");
     Ok(s)
 }
 

@@ -17,6 +17,7 @@
 mod device;
 mod egress;
 mod flow;
+mod logger;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as stdmpsc;
@@ -59,11 +60,14 @@ const RN_ERR_RUNTIME: i32 = -4;
 /// only until the socket is bound; the netstack then runs on its own threads.
 #[no_mangle]
 pub extern "C" fn rn_start(port: u16, transport: u32) -> i32 {
+    logger::init();
+    log::info!("rn_start(port={port}, transport={transport})");
     let mut guard = match INSTANCE.lock() {
         Ok(g) => g,
         Err(_) => return RN_ERR_RUNTIME,
     };
     if guard.is_some() {
+        log::warn!("rn_start: already running");
         return RN_ERR_ALREADY_RUNNING;
     }
 
@@ -89,6 +93,7 @@ pub extern "C" fn rn_start(port: u16, transport: u32) -> i32 {
     // Wait for the bind result so we can report a real success/failure.
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(())) => {
+            log::info!("rn_start: OK — listener up");
             *guard = Some(Instance {
                 shutdown: shutdown_tx,
                 handle,
@@ -112,6 +117,7 @@ pub extern "C" fn rn_start(port: u16, transport: u32) -> i32 {
 /// Stop the listener and tear everything down. Returns `0`, or `-1` if not running.
 #[no_mangle]
 pub extern "C" fn rn_stop() -> i32 {
+    log::info!("rn_stop()");
     let instance = match INSTANCE.lock() {
         Ok(mut g) => g.take(),
         Err(_) => return RN_ERR_RUNTIME,
@@ -120,10 +126,45 @@ pub extern "C" fn rn_stop() -> i32 {
         Some(inst) => {
             let _ = inst.shutdown.send(true);
             let _ = inst.handle.join();
+            log::info!(
+                "rn_stop: core stopped (session totals: rx {} B, tx {} B)",
+                RX_BYTES.load(Ordering::Relaxed),
+                TX_BYTES.load(Ordering::Relaxed)
+            );
             RN_OK
         }
-        None => RN_ERR_NOT_RUNNING,
+        None => {
+            log::warn!("rn_stop: not running");
+            RN_ERR_NOT_RUNNING
+        }
     }
+}
+
+/// Register a sink that receives every formatted log line (from Rust core and
+/// its dependencies). Pass `NULL` to unregister. Safe to call at any time;
+/// buffered lines are replayed to a newly-registered callback. The callback is
+/// invoked from arbitrary background threads and must not call `rn_*` functions.
+#[no_mangle]
+pub extern "C" fn rn_log_set_callback(cb: Option<extern "C" fn(line: *const std::os::raw::c_char)>) {
+    logger::init();
+    logger::set_callback(cb);
+}
+
+/// Set log verbosity: 0=off, 1=error, 2=warn, 3=info, 4=debug, 5+=trace.
+/// Default is 4 (debug).
+#[no_mangle]
+pub extern "C" fn rn_log_set_level(level: u32) {
+    logger::init();
+    let filter = match level {
+        0 => log::LevelFilter::Off,
+        1 => log::LevelFilter::Error,
+        2 => log::LevelFilter::Warn,
+        3 => log::LevelFilter::Info,
+        4 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    };
+    log::set_max_level(filter);
+    log::info!("log level set to {filter}");
 }
 
 /// Write cumulative byte counters. Either pointer may be null.
@@ -239,30 +280,54 @@ async fn bridge(stream: tokio::net::TcpStream) {
     config.with_tcp_config(tcp_config);
     config.udp_timeout(Duration::from_secs(30));
 
+    log::debug!(
+        "bridge up: ipstack mtu=65535, tcp mss=1360, tcp timeout=60s, udp timeout=30s"
+    );
     let mut ip_stack = IpStack::new(config, device);
+
+    // Heartbeat: cumulative traffic + flow counts every 15 s while connected,
+    // so a stalled link is visible in the log even when nothing errors.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // consume the immediate first tick
+    let (mut tcp_flows, mut udp_flows, mut other_flows) = (0u64, 0u64, 0u64);
 
     loop {
         tokio::select! {
             // Desktop disconnected: drop `ip_stack` (its internal task aborts)
             // and return so serve() can accept a reconnect.
             _ = &mut disconnected => {
-                log::debug!("desktop disconnected; tearing down ipstack");
+                log::info!(
+                    "desktop disconnected; tearing down ipstack (flows this session: {tcp_flows} tcp, {udp_flows} udp, {other_flows} other)"
+                );
                 break;
+            }
+            _ = heartbeat.tick() => {
+                log::debug!(
+                    "heartbeat: rx {} B, tx {} B, flows {tcp_flows} tcp / {udp_flows} udp / {other_flows} other",
+                    RX_BYTES.load(Ordering::Relaxed),
+                    TX_BYTES.load(Ordering::Relaxed),
+                );
             }
             accepted = ip_stack.accept() => {
                 match accepted {
                     Ok(IpStackStream::Tcp(tcp)) => {
+                        tcp_flows += 1;
                         tokio::spawn(flow::handle_tcp(tcp));
                     }
                     Ok(IpStackStream::Udp(udp)) => {
+                        udp_flows += 1;
                         tokio::spawn(flow::handle_udp(udp));
                     }
                     Ok(IpStackStream::UnknownTransport(u)) => {
+                        other_flows += 1;
                         tokio::spawn(flow::handle_unknown(u));
                     }
-                    Ok(IpStackStream::UnknownNetwork(_)) => {}
+                    Ok(IpStackStream::UnknownNetwork(p)) => {
+                        log::debug!("ipstack: dropped unknown network-layer packet ({} bytes)", p.len());
+                    }
                     Err(e) => {
-                        log::debug!("ipstack accept ended: {e}");
+                        log::warn!("ipstack accept ended: {e}");
                         break;
                     }
                 }

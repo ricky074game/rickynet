@@ -67,47 +67,59 @@ impl FramedDevice {
 async fn reader_task(mut rd: OwnedReadHalf, tx: mpsc::Sender<Vec<u8>>, _disc: oneshot::Sender<()>) {
     // When this task returns (EOF/error/device dropped), `_disc` drops and the
     // disconnect receiver in bridge() resolves.
-    loop {
+    let mut packets: u64 = 0;
+    let reason = loop {
         // Framing: [u16 big-endian length][length bytes]. tokio's read_u16 is
         // big-endian, matching rickynet-wire.
         let len = match rd.read_u16().await {
             Ok(n) => n as usize,
-            Err(_) => break, // EOF or error: desktop went away.
+            Err(e) => break format!("cable read ended: {e}"), // EOF/error: desktop went away
         };
         let mut buf = vec![0u8; len];
-        if rd.read_exact(&mut buf).await.is_err() {
-            break;
+        if let Err(e) = rd.read_exact(&mut buf).await {
+            break format!("cable read ended mid-frame: {e}");
         }
         // Bytes the desktop sent out to the internet = upload = TX.
         TX_BYTES.fetch_add(buf.len() as u64, Ordering::Relaxed);
-        if tx.send(buf).await.is_err() {
-            break; // device dropped
+        packets += 1;
+        if packets == 1 {
+            log::debug!("device: first packet from desktop ({len} bytes)");
         }
-    }
+        if tx.send(buf).await.is_err() {
+            break "device dropped".to_string();
+        }
+    };
+    log::info!("device reader done after {packets} packets ({reason})");
 }
 
 async fn writer_task(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
-    while let Some(pkt) = rx.recv().await {
+    let mut packets: u64 = 0;
+    let reason = loop {
+        let Some(pkt) = rx.recv().await else {
+            break "device dropped".to_string();
+        };
         if pkt.len() > u16::MAX as usize {
             // Can't frame it; drop rather than corrupt the stream.
             log::warn!("device: dropping oversize outbound packet ({} bytes)", pkt.len());
             continue;
         }
-        if wr.write_u16(pkt.len() as u16).await.is_err() {
-            break;
+        if let Err(e) = wr.write_u16(pkt.len() as u16).await {
+            break format!("cable write failed: {e}");
         }
-        if wr.write_all(&pkt).await.is_err() {
-            break;
+        if let Err(e) = wr.write_all(&pkt).await {
+            break format!("cable write failed: {e}");
         }
         // Bytes delivered back to the desktop = download = RX.
         RX_BYTES.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+        packets += 1;
         // Coalesce: only flush when the queue has momentarily drained.
         if rx.is_empty() {
-            if wr.flush().await.is_err() {
-                break;
+            if let Err(e) = wr.flush().await {
+                break format!("cable flush failed: {e}");
             }
         }
-    }
+    };
+    log::info!("device writer done after {packets} packets ({reason})");
 }
 
 impl AsyncRead for FramedDevice {

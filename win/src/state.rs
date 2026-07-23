@@ -16,7 +16,7 @@ pub enum ConnState {
     Error,
 }
 
-const LOG_CAP: usize = 8;
+const LOG_CAP: usize = 250;
 
 pub struct Shared {
     state: Mutex<ConnState>,
@@ -65,6 +65,9 @@ impl Shared {
     pub fn log(&self, line: impl Into<String>) {
         let line = line.into();
         log::info!("{line}");
+        // GUI copy gets a wall-clock (UTC) timestamp; the file/stderr copy above
+        // is timestamped by env_logger already.
+        let line = format!("{} {line}", utc_hms());
         let mut l = self.log.lock().unwrap();
         if l.len() == LOG_CAP {
             l.pop_front();
@@ -108,4 +111,13 @@ impl Shared {
     pub fn is_admin(&self) -> bool {
         self.admin.load(Ordering::Relaxed)
     }
+}
+
+/// `HH:MM:SS` in UTC (matches env_logger's UTC timestamps), no chrono needed.
+fn utc_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
 }

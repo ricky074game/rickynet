@@ -15,6 +15,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod args;
+mod logging;
 mod state;
 mod transport;
 mod usbmux;
@@ -33,8 +34,9 @@ mod tun;
 mod worker;
 
 fn main() {
-    // RUST_LOG overrides; default to info.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // RUST_LOG overrides; defaults to debug for RickyNet code. Logs are teed to
+    // stderr AND a file (see `logging`) so the GUI build still produces logs.
+    logging::init();
 
     let parsed = match args::parse(std::env::args()) {
         Ok(Some(a)) => a,
@@ -75,11 +77,20 @@ fn windows_main(args: args::Args) {
     // Primary elevation mechanism is the embedded requireAdministrator manifest
     // (build.rs). This runas relaunch is a fallback if the manifest is stripped.
     let elevated = elevation::is_elevated();
+    log::info!(
+        "mode: {}, transport: {}, port: {}, elevated: {elevated}",
+        if args.headless { "headless" } else { "gui" },
+        args.transport.label(),
+        args.port
+    );
     if !elevated {
+        log::warn!("not elevated; attempting UAC relaunch");
         if elevation::relaunch_as_admin() {
             // An elevated instance was spawned; this one exits.
+            log::info!("elevated instance launched; this instance exits");
             return;
         }
+        log::warn!("UAC relaunch failed or was declined");
         if args.headless {
             eprintln!(
                 "RickyNet needs Administrator to create the network adapter and set \

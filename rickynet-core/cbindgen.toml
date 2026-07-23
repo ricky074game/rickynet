@@ -11,7 +11,7 @@ cpp_compat = true
 [export]
 prefix = ""
 # Only export the rn_* C ABI surface.
-include = ["rn_start", "rn_stop", "rn_stats"]
+include = ["rn_start", "rn_stop", "rn_stats", "rn_log_set_callback", "rn_log_set_level", "RnLogCallback"]
 
 [fn]
 sort_by = "None"
