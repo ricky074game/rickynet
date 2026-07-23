@@ -272,7 +272,10 @@ async fn bridge(stream: tokio::net::TcpStream) {
     // kept polite to the desktop path via an explicit MSS clamp below.
     let _ = config.mtu(u16::MAX);
     let mut tcp_config = TcpConfig::default();
-    tcp_config.timeout = Duration::from_secs(60);
+    // 5 min idle timeout: browsers keep HTTP(S) connections alive and reuse
+    // them; a short timeout reaps them (the "closing forcefully" storm) and
+    // forces a fresh TLS handshake on the next request, which feels sluggish.
+    tcp_config.timeout = Duration::from_secs(300);
     // 1360 = 1400 (tunnel MTU) - 20 (IP) - 20 (TCP); keeps desktop-bound
     // segments within the Wintun path so nothing needs fragmenting.
     tcp_config.options = Some(vec![TcpOptions::MaximumSegmentSize(1360)]);
@@ -280,17 +283,20 @@ async fn bridge(stream: tokio::net::TcpStream) {
     config.with_tcp_config(tcp_config);
     config.udp_timeout(Duration::from_secs(30));
 
-    log::debug!(
-        "bridge up: ipstack mtu=65535, tcp mss=1360, tcp timeout=60s, udp timeout=30s"
-    );
+    log::info!("bridge up: tcp idle timeout=300s, udp timeout=30s, mss=1360");
     let mut ip_stack = IpStack::new(config, device);
 
-    // Heartbeat: cumulative traffic + flow counts every 15 s while connected,
-    // so a stalled link is visible in the log even when nothing errors.
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    // Throughput heartbeat (INFO, one line per 20 s): shows the ACTUAL up/down
+    // rate so a log tells us whether the link is fast, slow, or stalled — and
+    // whether the phone is hot while moving data (inherent cost) or hot while
+    // idle (a bug). Cheap enough to keep on in the lean default build.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // consume the immediate first tick
     let (mut tcp_flows, mut udp_flows, mut other_flows) = (0u64, 0u64, 0u64);
+    let mut last_rx = 0u64;
+    let mut last_tx = 0u64;
+    let mut last_beat = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -303,11 +309,20 @@ async fn bridge(stream: tokio::net::TcpStream) {
                 break;
             }
             _ = heartbeat.tick() => {
-                log::debug!(
-                    "heartbeat: rx {} B, tx {} B, flows {tcp_flows} tcp / {udp_flows} udp / {other_flows} other",
-                    RX_BYTES.load(Ordering::Relaxed),
-                    TX_BYTES.load(Ordering::Relaxed),
+                let rx = RX_BYTES.load(Ordering::Relaxed);
+                let tx = TX_BYTES.load(Ordering::Relaxed);
+                let now = tokio::time::Instant::now();
+                let secs = now.duration_since(last_beat).as_secs_f64().max(0.001);
+                let down_mbps = rx.saturating_sub(last_rx) as f64 * 8.0 / secs / 1.0e6;
+                let up_mbps = tx.saturating_sub(last_tx) as f64 * 8.0 / secs / 1.0e6;
+                log::info!(
+                    "traffic: down {down_mbps:.1} Mbps, up {up_mbps:.1} Mbps | cum rx {} MB / tx {} MB | flows {tcp_flows} tcp {udp_flows} udp {other_flows} other",
+                    rx / 1_000_000,
+                    tx / 1_000_000,
                 );
+                last_rx = rx;
+                last_tx = tx;
+                last_beat = now;
             }
             accepted = ip_stack.accept() => {
                 match accepted {
