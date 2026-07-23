@@ -45,6 +45,10 @@ targets:
       properties:
         CFBundleDisplayName: RickyNet
         CFBundleShortVersionString: "1.0.0"
+        # Silent-audio keep-alive: lets the tunnel survive backgrounding and
+        # screen-lock so the screen no longer has to be forced on.
+        UIBackgroundModes:
+          - audio
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64]
         UISupportedInterfaceOrientations:

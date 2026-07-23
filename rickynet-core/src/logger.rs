@@ -99,14 +99,17 @@ fn emit(cb: RnLogCallback, line: &str) {
     cb(c.as_ptr());
 }
 
-/// Install the logger (idempotent). Defaults to `Debug` so the friend-facing
-/// build is chatty; `rn_log_set_level` can dial it up/down.
+/// Install the logger (idempotent). Defaults to `Info`: this keeps the phone
+/// cool and quiet (ipstack's per-packet DEBUG logging — ~200 lines/sec on a
+/// busy page — is never even formatted at this level). Our own INFO lines still
+/// record start/stop/connect/disconnect/errors. `rn_log_set_level(4)` turns on
+/// full DEBUG (per-flow tracing + heartbeats) when a problem needs diagnosing.
 pub fn init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         START.get_or_init(Instant::now);
         let _ = log::set_logger(&CORE_LOGGER);
-        log::set_max_level(log::LevelFilter::Debug);
+        log::set_max_level(log::LevelFilter::Info);
         log::info!(
             "rickynet-core v{} logging up (level {})",
             env!("CARGO_PKG_VERSION"),

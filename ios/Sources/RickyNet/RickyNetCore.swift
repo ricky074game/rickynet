@@ -29,6 +29,7 @@ final class RickyNetCore: ObservableObject {
     /// Listener port. Mirrors rickynet_wire::DEFAULT_PORT.
     private let port: UInt16 = 27600
     private var timer: Timer?
+    private let keepAlive = KeepAlive()
 
     var isRunning: Bool { status == .running }
 
@@ -46,8 +47,10 @@ final class RickyNetCore: ObservableObject {
         if rc == 0 {
             LogStore.shared.app("core started OK")
             status = .running
-            // Keep the screen (and thus the app + its socket server) awake.
-            UIApplication.shared.isIdleTimerDisabled = true
+            // Silent-audio keep-alive lets the app survive backgrounding and
+            // screen-lock, so we DON'T force the screen on (the display was a
+            // major heat/battery drain). The friend can lock the phone.
+            keepAlive.start()
             startPolling()
         } else {
             LogStore.shared.app("core start FAILED: rc=\(rc) (\(Self.describe(rc)))")
@@ -58,7 +61,7 @@ final class RickyNetCore: ObservableObject {
     func stop() {
         let rc = rn_stop()
         LogStore.shared.app("stop tapped (rn_stop rc=\(rc); session rx \(rxBytes) B, tx \(txBytes) B)")
-        UIApplication.shared.isIdleTimerDisabled = false
+        keepAlive.stop()
         stopPolling()
         rxBytes = 0
         txBytes = 0
