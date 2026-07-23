@@ -76,19 +76,23 @@ struct ContentView: View {
 
     private var counters: some View {
         HStack(spacing: 40) {
-            counter(symbol: "arrow.down", label: "Down", bytes: core.rxBytes, color: .blue)
-            counter(symbol: "arrow.up", label: "Up", bytes: core.txBytes, color: .purple)
+            counter(symbol: "arrow.down", label: "Down", rate: core.rxRate, total: core.rxBytes, color: .blue)
+            counter(symbol: "arrow.up", label: "Up", rate: core.txRate, total: core.txBytes, color: .purple)
         }
     }
 
-    private func counter(symbol: String, label: String, bytes: UInt64, color: Color) -> some View {
+    private func counter(symbol: String, label: String, rate: Double, total: UInt64, color: Color) -> some View {
         VStack(spacing: 4) {
             Label(label, systemImage: symbol)
                 .font(.caption)
                 .foregroundStyle(color)
-            Text(Self.humanBytes(bytes))
-                .font(.system(.title3, design: .monospaced))
+            // Live speed in MB/s, refreshed once per second.
+            Text(Self.speedMBps(rate))
+                .font(.system(.title2, design: .monospaced).weight(.semibold))
                 .contentTransition(.numericText())
+            Text("total \(Self.humanBytes(total))")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -106,6 +110,12 @@ struct ContentView: View {
         case .running: return "Running"
         case .error(let msg): return "Error: \(msg)"
         }
+    }
+
+    /// Live transfer rate in MB/s (mebibytes/sec), always shown in MB as asked.
+    static func speedMBps(_ bytesPerSecond: Double) -> String {
+        let mb = max(0, bytesPerSecond) / (1024 * 1024)
+        return String(format: "%.2f MB/s", mb)
     }
 
     static func humanBytes(_ n: UInt64) -> String {

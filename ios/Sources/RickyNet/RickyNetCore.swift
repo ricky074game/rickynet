@@ -19,6 +19,14 @@ final class RickyNetCore: ObservableObject {
     @Published private(set) var status: Status = .stopped
     @Published private(set) var rxBytes: UInt64 = 0
     @Published private(set) var txBytes: UInt64 = 0
+    /// Live transfer rate in bytes/sec, refreshed every second by the poll timer.
+    @Published private(set) var rxRate: Double = 0 // download (internet → PC)
+    @Published private(set) var txRate: Double = 0 // upload   (PC → internet)
+
+    // Previous sample, for computing the per-second rate.
+    private var lastRx: UInt64 = 0
+    private var lastTx: UInt64 = 0
+    private var lastSample: Date?
 
     /// Accept connections over Wi-Fi/LAN as well as USB. When false we bind
     /// loopback only (usbmux still reaches us at 127.0.0.1), which is the more
@@ -65,6 +73,9 @@ final class RickyNetCore: ObservableObject {
         stopPolling()
         rxBytes = 0
         txBytes = 0
+        rxRate = 0
+        txRate = 0
+        lastSample = nil
         status = .stopped
     }
 
@@ -78,13 +89,29 @@ final class RickyNetCore: ObservableObject {
 
     private func startPolling() {
         stopPolling()
+        lastRx = 0
+        lastTx = 0
+        lastSample = nil
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             var rx: UInt64 = 0
             var tx: UInt64 = 0
             rn_stats(&rx, &tx)
+            let now = Date()
             Task { @MainActor in
-                self?.rxBytes = rx
-                self?.txBytes = tx
+                guard let self else { return }
+                // Per-second rate = bytes since last sample / elapsed seconds.
+                if let last = self.lastSample {
+                    let dt = now.timeIntervalSince(last)
+                    if dt > 0 {
+                        self.rxRate = Double(rx &- self.lastRx) / dt
+                        self.txRate = Double(tx &- self.lastTx) / dt
+                    }
+                }
+                self.lastRx = rx
+                self.lastTx = tx
+                self.lastSample = now
+                self.rxBytes = rx
+                self.txBytes = tx
             }
         }
         RunLoop.main.add(t, forMode: .common)
